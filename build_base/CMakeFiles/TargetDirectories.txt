@@ -1,0 +1,3 @@
+/home/cat/gsb/uid3596/build_base/CMakeFiles/bc7enc.dir
+/home/cat/gsb/uid3596/build_base/CMakeFiles/edit_cache.dir
+/home/cat/gsb/uid3596/build_base/CMakeFiles/rebuild_cache.dir

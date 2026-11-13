@@ -83,6 +83,8 @@ namespace rdo_bc
 			m_status_output = false;
 			
 			m_rdo_max_threads = 128;
+
+			m_alpha_bleed = true;
 		}
 
 		int m_bc7_uber_level;
@@ -127,8 +129,14 @@ namespace rdo_bc
 
 		bool m_use_bc7e;
 		bool m_status_output;
-		
+
 		uint32_t m_rdo_max_threads;
+
+		// When true (the default), texels with alpha=0 are preprocessed before encoding so their RGB can't pollute
+		// the quantized colors of visible texels: fully transparent blocks are zeroed (so they decode to RGBA 0,0,0,0),
+		// and transparent texels in partially transparent blocks are filled with the average color of the block's
+		// non-transparent texels (alpha bleeding). Prevents dark/colored fringes along alpha edges.
+		bool m_alpha_bleed;
 	};
 
 	class rdo_bc_encoder

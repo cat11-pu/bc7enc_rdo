@@ -483,6 +483,73 @@ namespace rdo_bc
 				}
 			}
 		}
+
+		// Alpha-aware preprocessing: texels with alpha=0 are invisible, but their RGB would otherwise be treated as
+		// valid colors during endpoint quantization, polluting the colors of visible texels in the same block
+		// (the classic dark/colored fringes along alpha edges). 
+		// - Fully transparent blocks are zeroed so they decode to RGBA(0,0,0,0) regardless of the chroma
+		//   that happened to be stored in the transparent region.
+		// - Transparent texels in partially transparent blocks are filled with the average RGB of the block's
+		//   non-transparent texels (alpha bleeding), so they no longer drag the quantized endpoints away from
+		//   the visible colors.
+		if (has_alpha && m_params.m_alpha_bleed &&
+			(m_params.m_dxgi_format != DXGI_FORMAT_BC4_UNORM) && (m_params.m_dxgi_format != DXGI_FORMAT_BC5_UNORM))
+		{
+			for (uint32_t by = 0; by < m_blocks_y; by++)
+			{
+				for (uint32_t bx = 0; bx < m_blocks_x; bx++)
+				{
+					color_quad_u8 pixels[16];
+					m_source_image.get_block(bx, by, 4, 4, pixels);
+
+					uint32_t num_visible = 0;
+					uint32_t sum_r = 0, sum_g = 0, sum_b = 0;
+					for (uint32_t i = 0; i < 16; i++)
+					{
+						if (pixels[i].m_c[3] != 0)
+						{
+							num_visible++;
+							sum_r += pixels[i].m_c[0];
+							sum_g += pixels[i].m_c[1];
+							sum_b += pixels[i].m_c[2];
+						}
+					}
+
+					if (num_visible == 16)
+						continue;
+
+					if (num_visible == 0)
+					{
+						// Fully transparent block: zero the RGB so the decoded transparent region is black.
+						for (uint32_t i = 0; i < 16; i++)
+						{
+							pixels[i].m_c[0] = 0;
+							pixels[i].m_c[1] = 0;
+							pixels[i].m_c[2] = 0;
+						}
+					}
+					else
+					{
+						// Partially transparent block: bleed the average visible color into transparent texels.
+						const uint8_t avg_r = (uint8_t)((sum_r + num_visible / 2) / num_visible);
+						const uint8_t avg_g = (uint8_t)((sum_g + num_visible / 2) / num_visible);
+						const uint8_t avg_b = (uint8_t)((sum_b + num_visible / 2) / num_visible);
+
+						for (uint32_t i = 0; i < 16; i++)
+						{
+							if (pixels[i].m_c[3] == 0)
+							{
+								pixels[i].m_c[0] = avg_r;
+								pixels[i].m_c[1] = avg_g;
+								pixels[i].m_c[2] = avg_b;
+							}
+						}
+					}
+
+					m_source_image.set_block(bx, by, 4, 4, pixels);
+				}
+			}
+		}
 				
 		if (m_pixel_format_bpp == 8)
 			m_packed_image16.resize(m_total_blocks);
