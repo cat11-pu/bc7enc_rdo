@@ -1,8 +1,8 @@
+cmake_minimum_required(VERSION 3.5)
 project(bc7enc)
-
-cmake_minimum_required(VERSION 2.8)
 option(BUILD_X64 "build 64-bit" TRUE)
 option(SUPPORT_BC7E "support BC7E (requires ispc)" FALSE)
+option(BC7ENC_ENABLE_AVX2 "enable AVX2 accelerated BC7 block encoding" TRUE)
 
 message("Initial BUILD_X64=${BUILD_X64}")
 message("Initial CMAKE_BUILD_TYPE=${CMAKE_BUILD_TYPE}")
@@ -67,6 +67,22 @@ endif()
 set(CMAKE_CXX_FLAGS_RELEASE  "${CMAKE_CXX_FLAGS_RELEASE} ${GCC_COMPILE_FLAGS}")
 set(CMAKE_CXX_FLAGS_DEBUG "${CMAKE_CXX_FLAGS_DEBUG} ${GCC_COMPILE_FLAGS} -D_DEBUG")
 
+if (BC7ENC_ENABLE_AVX2)
+	include(CheckCXXCompilerFlag)
+	if (MSVC)
+		set(CMAKE_CXX_FLAGS_RELEASE "${CMAKE_CXX_FLAGS_RELEASE} /arch:AVX2")
+		message(STATUS "BC7ENC: AVX2 enabled")
+	else()
+		check_cxx_compiler_flag("-mavx2" BC7ENC_HAS_AVX2)
+		if (BC7ENC_HAS_AVX2)
+			set(CMAKE_CXX_FLAGS_RELEASE "${CMAKE_CXX_FLAGS_RELEASE} -mavx2")
+			message(STATUS "BC7ENC: AVX2 enabled")
+		else()
+			message(WARNING "BC7ENC: compiler does not support -mavx2, using scalar path")
+		endif()
+	endif()
+endif()
+
 set (BC7ENC_SRC_LIST ${COMMON_SRC_LIST}
 	bc7enc.cpp
 	bc7enc.h
@@ -104,5 +120,3 @@ endif()
 if (NOT MSVC)
 	target_link_libraries(bc7enc m)
 endif()
-
-

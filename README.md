@@ -34,6 +34,11 @@ cmake .
 make
 ```
 
+Release builds enable the AVX2 BC7 block-encoding fast path by default. It uses
+per-block plane precomputation, mask-based partition evaluation, and vectorized
+endpoint scoring while preserving per-block deterministic output. Pass
+`-DBC7ENC_ENABLE_AVX2=OFF` when targeting x86 CPUs without AVX2.
+
 Note the MSVC and Linux builds enable OpenMP for faster compression.
 
 ### Examples
@@ -162,4 +167,3 @@ For BC1-5 encoding/decoding: rgbcx.cpp/.h
 For BC7 encoding: bc7enc.cpp/.h
 
 For BC7 decoding: bc7decomp.cpp/.h
-

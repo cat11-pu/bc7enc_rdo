@@ -7,6 +7,13 @@
 #include <limits.h>
 #include <algorithm>
 
+#if defined(__AVX2__) || defined(_M_AVX2)
+#include <immintrin.h>
+#define BC7ENC_AVX2 1
+#else
+#define BC7ENC_AVX2 0
+#endif
+
 // Helpers
 static inline int32_t clampi(int32_t value, int32_t low, int32_t high) { if (value < low) value = low; else if (value > high) value = high;	return value; }
 static inline float clampf(float value, float low, float high) { if (value < low) value = low; else if (value > high) value = high;	return value; }
@@ -118,6 +125,9 @@ static float g_mode7_rgba_midpoints[32][2];
 
 static uint8_t g_mode6_reduced_quant[2048][2];
 
+static uint16_t g_bc7_partition2_pixelmask[64][2];
+static uint8_t g_bc7_partition2_subset_size[64][2];
+
 static bool g_initialized;
 
 // Initialize the lookup table used for optimal single color compression in mode 1/7. Must be called before encoding.
@@ -209,6 +219,20 @@ void bc7enc_compress_block_init()
 			g_mode6_reduced_quant[i][p] = (uint8_t)best_index;
 		}
 	} // p
+
+	for (uint32_t partition = 0; partition < 64; partition++)
+	{
+		g_bc7_partition2_pixelmask[partition][0] = 0;
+		g_bc7_partition2_pixelmask[partition][1] = 0;
+		g_bc7_partition2_subset_size[partition][0] = 0;
+		g_bc7_partition2_subset_size[partition][1] = 0;
+		for (uint32_t i = 0; i < 16; i++)
+		{
+			const uint32_t subset = g_bc7_partition2[partition * 16 + i];
+			g_bc7_partition2_pixelmask[partition][subset] |= (uint16_t)(1U << i);
+			g_bc7_partition2_subset_size[partition][subset]++;
+		}
+	}
 
 	// Mode 1
 	for (int c = 0; c < 256; c++)
@@ -459,10 +483,43 @@ static void compute_least_squares_endpoints_a(uint32_t N, const uint8_t* pSelect
 	}
 }
 
+struct pixel_planes
+{
+	int32_t m_r[16], m_g[16], m_b[16], m_a[16];
+	int32_t m_l[16], m_cr[16], m_cb[16];
+};
+
+static inline void compute_pixel_planes(const color_rgba *pPixels, uint32_t num_pixels, pixel_planes *pPlanes)
+{
+	for (uint32_t i = 0; i < num_pixels; i++)
+	{
+		const int32_t r = pPixels[i].m_c[0], g = pPixels[i].m_c[1], b = pPixels[i].m_c[2], a = pPixels[i].m_c[3];
+		const int32_t l = r * 109 + g * 366 + b * 37;
+		pPlanes->m_r[i] = r;
+		pPlanes->m_g[i] = g;
+		pPlanes->m_b[i] = b;
+		pPlanes->m_a[i] = a;
+		pPlanes->m_l[i] = l;
+		pPlanes->m_cr[i] = (r << 9) - l;
+		pPlanes->m_cb[i] = (b << 9) - l;
+	}
+	for (uint32_t i = num_pixels; i < 16; i++)
+	{
+		pPlanes->m_r[i] = 0;
+		pPlanes->m_g[i] = 0;
+		pPlanes->m_b[i] = 0;
+		pPlanes->m_a[i] = 0;
+		pPlanes->m_l[i] = 0;
+		pPlanes->m_cr[i] = 0;
+		pPlanes->m_cb[i] = 0;
+	}
+}
+
 struct color_cell_compressor_params
 {
 	uint32_t m_num_pixels;
 	const color_rgba *m_pPixels;
+	const pixel_planes *m_pPlanes;
 	uint32_t m_num_selector_weights;
 	const uint32_t *m_pSelector_weights;
 	const vec4F *m_pSelector_weightsx;
@@ -534,6 +591,134 @@ static inline uint64_t compute_color_distance_rgba(const color_rgba *pE1, const 
 	return compute_color_distance_rgb(pE1, pE2, perceptual, weights) + (weights[3] * (uint32_t)(da * da));
 }
 
+#if BC7ENC_AVX2
+static inline __m256i make_avx2_mask8(uint32_t bits)
+{
+	const __m256i bit_masks = _mm256_setr_epi32(1, 2, 4, 8, 16, 32, 64, 128);
+	const __m256i bits_vec = _mm256_set1_epi32((int)bits);
+	const __m256i selected = _mm256_and_si256(bits_vec, bit_masks);
+	return _mm256_cmpeq_epi32(selected, bit_masks);
+}
+
+static inline uint64_t horizontal_sum_u32(__m256i v)
+{
+	alignas(32) uint32_t lanes[8];
+	_mm256_store_si256((__m256i *)lanes, v);
+	uint64_t sum = 0;
+	for (uint32_t i = 0; i < 8; i++)
+		sum += lanes[i];
+	return sum;
+}
+
+static inline uint32_t reduce_masked_min_u32_256(const int32_t *pValues, uint16_t mask)
+{
+	const __m256i sentinel = _mm256_set1_epi32(255);
+	__m256i result = sentinel;
+	for (uint32_t chunk = 0; chunk < 2; chunk++)
+	{
+		const uint32_t base = chunk * 8;
+		const __m256i valid = make_avx2_mask8((mask >> base) & 0xFF);
+		const __m256i values = _mm256_loadu_si256((const __m256i *)&pValues[base]);
+		result = _mm256_min_epu32(result, _mm256_blendv_epi8(sentinel, values, valid));
+	}
+	alignas(32) uint32_t lanes[8];
+	_mm256_store_si256((__m256i *)lanes, result);
+	uint32_t v = lanes[0];
+	for (uint32_t i = 1; i < 8; i++)
+		v = minimumu(v, lanes[i]);
+	return v;
+}
+
+static inline uint32_t reduce_masked_max_u32_256(const int32_t *pValues, uint16_t mask)
+{
+	const __m256i sentinel = _mm256_setzero_si256();
+	__m256i result = sentinel;
+	for (uint32_t chunk = 0; chunk < 2; chunk++)
+	{
+		const uint32_t base = chunk * 8;
+		const __m256i valid = make_avx2_mask8((mask >> base) & 0xFF);
+		const __m256i values = _mm256_loadu_si256((const __m256i *)&pValues[base]);
+		result = _mm256_max_epu32(result, _mm256_blendv_epi8(sentinel, values, valid));
+	}
+	alignas(32) uint32_t lanes[8];
+	_mm256_store_si256((__m256i *)lanes, result);
+	uint32_t v = lanes[0];
+	for (uint32_t i = 1; i < 8; i++)
+		v = maximumu(v, lanes[i]);
+	return v;
+}
+#endif
+
+static uint64_t compute_pixel_distance_sum(const color_cell_compressor_params *pParams, const pixel_planes *pPlanes, const color_rgba *pPalette)
+{
+	const uint32_t num_pixels = pParams->m_num_pixels;
+	const bool perceptual = pParams->m_perceptual;
+
+#if BC7ENC_AVX2
+	int32_t palette_l = 0, palette_cr = 0, palette_cb = 0;
+	if (perceptual)
+	{
+		palette_l = pPalette->m_c[0] * 109 + pPalette->m_c[1] * 366 + pPalette->m_c[2] * 37;
+		palette_cr = ((int32_t)pPalette->m_c[0] << 9) - palette_l;
+		palette_cb = ((int32_t)pPalette->m_c[2] << 9) - palette_l;
+	}
+
+	const __m256i vw0 = _mm256_set1_epi32((int)pParams->m_weights[0]);
+	const __m256i vw1 = _mm256_set1_epi32((int)pParams->m_weights[1]);
+	const __m256i vw2 = _mm256_set1_epi32((int)pParams->m_weights[2]);
+	const __m256i vw3 = _mm256_set1_epi32((int)pParams->m_weights[3]);
+	const __m256i zero = _mm256_setzero_si256();
+	__m256i total = zero;
+
+	for (uint32_t chunk = 0; chunk < 2; chunk++)
+	{
+		const uint32_t base = chunk * 8;
+		const uint32_t bits = (num_pixels > base) ? ((1U << minimumu(8, num_pixels - base)) - 1U) : 0;
+		const __m256i valid = make_avx2_mask8(bits);
+
+		__m256i e0, e1, e2;
+		if (perceptual)
+		{
+			e0 = _mm256_srai_epi32(_mm256_sub_epi32(_mm256_set1_epi32(palette_l), _mm256_loadu_si256((const __m256i *)&pPlanes->m_l[base])), 8);
+			e1 = _mm256_srai_epi32(_mm256_sub_epi32(_mm256_set1_epi32(palette_cr), _mm256_loadu_si256((const __m256i *)&pPlanes->m_cr[base])), 8);
+			e2 = _mm256_srai_epi32(_mm256_sub_epi32(_mm256_set1_epi32(palette_cb), _mm256_loadu_si256((const __m256i *)&pPlanes->m_cb[base])), 8);
+		}
+		else
+		{
+			e0 = _mm256_sub_epi32(_mm256_loadu_si256((const __m256i *)&pPlanes->m_r[base]), _mm256_set1_epi32(pPalette->m_c[0]));
+			e1 = _mm256_sub_epi32(_mm256_loadu_si256((const __m256i *)&pPlanes->m_g[base]), _mm256_set1_epi32(pPalette->m_c[1]));
+			e2 = _mm256_sub_epi32(_mm256_loadu_si256((const __m256i *)&pPlanes->m_b[base]), _mm256_set1_epi32(pPalette->m_c[2]));
+		}
+
+		__m256i err = _mm256_add_epi32(
+			_mm256_add_epi32(
+				_mm256_mullo_epi32(_mm256_mullo_epi32(e0, e0), vw0),
+				_mm256_mullo_epi32(_mm256_mullo_epi32(e1, e1), vw1)),
+			_mm256_mullo_epi32(_mm256_mullo_epi32(e2, e2), vw2));
+
+		if (pParams->m_has_alpha)
+		{
+			const __m256i ea = _mm256_sub_epi32(_mm256_loadu_si256((const __m256i *)&pPlanes->m_a[base]), _mm256_set1_epi32(pPalette->m_c[3]));
+			err = _mm256_add_epi32(err, _mm256_mullo_epi32(_mm256_mullo_epi32(ea, ea), vw3));
+		}
+
+		total = _mm256_add_epi32(total, _mm256_and_si256(err, valid));
+	}
+
+	return horizontal_sum_u32(total);
+#else
+	uint64_t total_err = 0;
+	for (uint32_t i = 0; i < num_pixels; i++)
+	{
+		if (pParams->m_has_alpha)
+			total_err += compute_color_distance_rgba(pPalette, &pParams->m_pPixels[i], perceptual, pParams->m_weights);
+		else
+			total_err += compute_color_distance_rgb(pPalette, &pParams->m_pPixels[i], perceptual, pParams->m_weights);
+	}
+	return total_err;
+#endif
+}
+
 static uint64_t pack_mode1_to_one_color(const color_cell_compressor_params *pParams, color_cell_compressor_results *pResults, uint32_t r, uint32_t g, uint32_t b, uint8_t *pSelectors)
 {
 	uint32_t best_err = UINT_MAX;
@@ -575,9 +760,7 @@ static uint64_t pack_mode1_to_one_color(const color_cell_compressor_params *pPar
 	}
 	p.m_c[3] = 255;
 
-	uint64_t total_err = 0;
-	for (uint32_t i = 0; i < pParams->m_num_pixels; i++)
-		total_err += compute_color_distance_rgb(&p, &pParams->m_pPixels[i], pParams->m_perceptual, pParams->m_weights);
+	const uint64_t total_err = compute_pixel_distance_sum(pParams, pParams->m_pPlanes, &p);
 
 	pResults->m_best_overall_err = total_err;
 
@@ -587,6 +770,8 @@ static uint64_t pack_mode1_to_one_color(const color_cell_compressor_params *pPar
 static uint64_t pack_mode7_to_one_color(const color_cell_compressor_params* pParams, color_cell_compressor_results* pResults, uint32_t r, uint32_t g, uint32_t b, uint32_t a,
 	uint8_t* pSelectors, uint32_t num_pixels, const color_rgba *pPixels)
 {
+	(void)num_pixels;
+	(void)pPixels;
 	uint32_t best_err = UINT_MAX;
 	uint32_t best_p = 0;
 
@@ -633,13 +818,94 @@ static uint64_t pack_mode7_to_one_color(const color_cell_compressor_params* pPar
 		p.m_c[i] = (uint8_t)((low * (64 - g_bc7_weights2[BC7E_MODE_7_OPTIMAL_INDEX]) + high * g_bc7_weights2[BC7E_MODE_7_OPTIMAL_INDEX] + 32) >> 6);
 	}
 
-	uint64_t total_err = 0;
-	for (uint32_t i = 0; i < num_pixels; i++)
-		total_err += compute_color_distance_rgba(&p, &pPixels[i], pParams->m_perceptual, pParams->m_weights);
+	const uint64_t total_err = compute_pixel_distance_sum(pParams, pParams->m_pPlanes, &p);
 
 	pResults->m_best_overall_err = total_err;
 
 	return total_err;
+}
+
+static uint64_t evaluate_perceptual_selectors(const color_cell_compressor_params *pParams, const pixel_planes *pPlanes, const color_rgba *pWeightedColors, uint32_t num_weights, uint8_t *pSelectors)
+{
+	const uint32_t num_pixels = pParams->m_num_pixels;
+	int32_t palette_l[16], palette_cr[16], palette_cb[16];
+	for (uint32_t j = 0; j < num_weights; j++)
+	{
+		const int32_t l = pWeightedColors[j].m_c[0] * 109 + pWeightedColors[j].m_c[1] * 366 + pWeightedColors[j].m_c[2] * 37;
+		palette_l[j] = l;
+		palette_cr[j] = ((int32_t)pWeightedColors[j].m_c[0] << 9) - l;
+		palette_cb[j] = ((int32_t)pWeightedColors[j].m_c[2] << 9) - l;
+	}
+
+#if BC7ENC_AVX2
+	const __m256i vw0 = _mm256_set1_epi32((int)pParams->m_weights[0]);
+	const __m256i vw1 = _mm256_set1_epi32((int)pParams->m_weights[1]);
+	const __m256i vw2 = _mm256_set1_epi32((int)pParams->m_weights[2]);
+	const __m256i vw3 = _mm256_set1_epi32((int)pParams->m_weights[3]);
+	const __m256i max_err = _mm256_set1_epi32(INT_MAX);
+	__m256i best_err[2] = { max_err, max_err };
+	__m256i best_sel[2] = { _mm256_setzero_si256(), _mm256_setzero_si256() };
+
+	for (uint32_t j = 0; j < num_weights; j++)
+	{
+		for (uint32_t chunk = 0; chunk < 2; chunk++)
+		{
+			const uint32_t base = chunk * 8;
+			const __m256i e0 = _mm256_srai_epi32(_mm256_sub_epi32(_mm256_set1_epi32(palette_l[j]), _mm256_loadu_si256((const __m256i *)&pPlanes->m_l[base])), 8);
+			const __m256i e1 = _mm256_srai_epi32(_mm256_sub_epi32(_mm256_set1_epi32(palette_cr[j]), _mm256_loadu_si256((const __m256i *)&pPlanes->m_cr[base])), 8);
+			const __m256i e2 = _mm256_srai_epi32(_mm256_sub_epi32(_mm256_set1_epi32(palette_cb[j]), _mm256_loadu_si256((const __m256i *)&pPlanes->m_cb[base])), 8);
+			__m256i err = _mm256_add_epi32(
+				_mm256_add_epi32(
+					_mm256_mullo_epi32(_mm256_mullo_epi32(e0, e0), vw0),
+					_mm256_mullo_epi32(_mm256_mullo_epi32(e1, e1), vw1)),
+				_mm256_mullo_epi32(_mm256_mullo_epi32(e2, e2), vw2));
+			if (pParams->m_has_alpha)
+			{
+				const __m256i ea = _mm256_sub_epi32(_mm256_set1_epi32(pWeightedColors[j].m_c[3]), _mm256_loadu_si256((const __m256i *)&pPlanes->m_a[base]));
+				err = _mm256_add_epi32(err, _mm256_mullo_epi32(_mm256_mullo_epi32(ea, ea), vw3));
+			}
+
+			const __m256i better = _mm256_cmpgt_epi32(best_err[chunk], err);
+			best_err[chunk] = _mm256_blendv_epi8(best_err[chunk], err, better);
+			best_sel[chunk] = _mm256_blendv_epi8(best_sel[chunk], _mm256_set1_epi32((int)j), better);
+		}
+	}
+
+	alignas(32) int32_t selector_lanes[16];
+	alignas(32) uint32_t error_lanes[16];
+	_mm256_store_si256((__m256i *)&selector_lanes[0], best_sel[0]);
+	_mm256_store_si256((__m256i *)&selector_lanes[8], best_sel[1]);
+	_mm256_store_si256((__m256i *)&error_lanes[0], best_err[0]);
+	_mm256_store_si256((__m256i *)&error_lanes[8], best_err[1]);
+	uint64_t total_err = 0;
+	for (uint32_t i = 0; i < num_pixels; i++)
+	{
+		pSelectors[i] = (uint8_t)selector_lanes[i];
+		total_err += error_lanes[i];
+	}
+	return total_err;
+#else
+	uint64_t total_err = 0;
+	for (uint32_t i = 0; i < num_pixels; i++)
+	{
+		uint64_t best_err = UINT64_MAX;
+		uint32_t best_sel = 0;
+		for (uint32_t j = 0; j < num_weights; j++)
+		{
+			uint64_t err = pParams->m_has_alpha ?
+				compute_color_distance_rgba(&pWeightedColors[j], &pParams->m_pPixels[i], true, pParams->m_weights) :
+				compute_color_distance_rgb(&pWeightedColors[j], &pParams->m_pPixels[i], true, pParams->m_weights);
+			if (err < best_err)
+			{
+				best_err = err;
+				best_sel = j;
+			}
+		}
+		pSelectors[i] = (uint8_t)best_sel;
+		total_err += best_err;
+	}
+	return total_err;
+#endif
 }
 
 static uint64_t evaluate_solution(const color_rgba *pLow, const color_rgba *pHigh, const uint32_t pbits[2], const color_cell_compressor_params *pParams, color_cell_compressor_results *pResults,
@@ -777,41 +1043,7 @@ static uint64_t evaluate_solution(const color_rgba *pLow, const color_rgba *pHig
 	}
 	else
 	{
-		// TODO: This could be improved.
-		for (uint32_t i = 0; i < pParams->m_num_pixels; i++)
-		{
-			uint64_t best_err = UINT64_MAX;
-			uint32_t best_sel = 0;
-
-			if (pParams->m_has_alpha)
-			{
-				for (uint32_t j = 0; j < N; j++)
-				{
-					uint64_t err = compute_color_distance_rgba(&weightedColors[j], &pParams->m_pPixels[i], true, pParams->m_weights);
-					if (err < best_err)
-					{
-						best_err = err;
-						best_sel = j;
-					}
-				}
-			}
-			else
-			{
-				for (uint32_t j = 0; j < N; j++)
-				{
-					uint64_t err = compute_color_distance_rgb(&weightedColors[j], &pParams->m_pPixels[i], true, pParams->m_weights);
-					if (err < best_err)
-					{
-						best_err = err;
-						best_sel = j;
-					}
-				}
-			}
-
-			total_err += best_err;
-
-			pResults->m_pSelectors_temp[i] = (uint8_t)best_sel;
-		}
+		total_err += evaluate_perceptual_selectors(pParams, pParams->m_pPlanes, weightedColors, N, pResults->m_pSelectors_temp);
 	}
 
 	if (total_err < pResults->m_best_overall_err)
@@ -1101,6 +1333,12 @@ static uint64_t find_optimal_solution(uint32_t mode, vec4F xl, vec4F xh, const c
 static uint64_t color_cell_compression(uint32_t mode, const color_cell_compressor_params *pParams, color_cell_compressor_results *pResults, const bc7enc_compress_block_params *pComp_params)
 {
 	assert((mode == 6) || (mode == 7) || (!pParams->m_has_alpha));
+
+	pixel_planes planes;
+	compute_pixel_planes(pParams->m_pPixels, pParams->m_num_pixels, &planes);
+	color_cell_compressor_params local_params = *pParams;
+	local_params.m_pPlanes = &planes;
+	pParams = &local_params;
 
 	pResults->m_best_overall_err = UINT64_MAX;
 
@@ -1440,26 +1678,39 @@ static uint64_t color_cell_compression(uint32_t mode, const color_cell_compresso
 	return pResults->m_best_overall_err;
 }
 
-static uint64_t color_cell_compression_est_mode1(uint32_t num_pixels, const color_rgba *pPixels, bool perceptual, uint32_t pweights[4], uint64_t best_err_so_far)
+static uint64_t color_cell_compression_est_mode1(uint32_t num_pixels, const pixel_planes *pPlanes, uint16_t pixel_mask, bool perceptual, uint32_t pweights[4], uint64_t best_err_so_far)
 {
-	// Find RGB bounds as an approximation of the block's principle axis
+	(void)best_err_so_far;
+	(void)num_pixels;
+
+	// Find RGB bounds as an approximation of the block's principle axis.
 	uint32_t lr = 255, lg = 255, lb = 255;
 	uint32_t hr = 0, hg = 0, hb = 0;
-	for (uint32_t i = 0; i < num_pixels; i++)
+#if BC7ENC_AVX2
+	lr = reduce_masked_min_u32_256(pPlanes->m_r, pixel_mask);
+	lg = reduce_masked_min_u32_256(pPlanes->m_g, pixel_mask);
+	lb = reduce_masked_min_u32_256(pPlanes->m_b, pixel_mask);
+	hr = reduce_masked_max_u32_256(pPlanes->m_r, pixel_mask);
+	hg = reduce_masked_max_u32_256(pPlanes->m_g, pixel_mask);
+	hb = reduce_masked_max_u32_256(pPlanes->m_b, pixel_mask);
+#else
+	for (uint32_t i = 0; i < 16; i++)
 	{
-		const color_rgba *pC = &pPixels[i];
-		if (pC->m_c[0] < lr) lr = pC->m_c[0];
-		if (pC->m_c[1] < lg) lg = pC->m_c[1];
-		if (pC->m_c[2] < lb) lb = pC->m_c[2];
-		if (pC->m_c[0] > hr) hr = pC->m_c[0];
-		if (pC->m_c[1] > hg) hg = pC->m_c[1];
-		if (pC->m_c[2] > hb) hb = pC->m_c[2];
+		if ((pixel_mask & (1U << i)) == 0)
+			continue;
+		lr = minimumu(lr, (uint32_t)pPlanes->m_r[i]);
+		lg = minimumu(lg, (uint32_t)pPlanes->m_g[i]);
+		lb = minimumu(lb, (uint32_t)pPlanes->m_b[i]);
+		hr = maximumu(hr, (uint32_t)pPlanes->m_r[i]);
+		hg = maximumu(hg, (uint32_t)pPlanes->m_g[i]);
+		hb = maximumu(hb, (uint32_t)pPlanes->m_b[i]);
 	}
-		
+#endif
+
 	color_rgba lowColor; color_quad_u8_set(&lowColor, lr, lg, lb, 0);
 	color_rgba highColor; color_quad_u8_set(&highColor, hr, hg, hb, 0);
 
-	// Place endpoints at bbox diagonals and compute interpolated colors 
+	// Place endpoints at bbox diagonals and compute interpolated colors.
 	const uint32_t N = 8;
 	color_rgba weightedColors[8];
 
@@ -1472,7 +1723,6 @@ static uint64_t color_cell_compression_est_mode1(uint32_t num_pixels, const colo
 		weightedColors[i].m_c[2] = (uint8_t)((lowColor.m_c[2] * (64 - g_bc7_weights3[i]) + highColor.m_c[2] * g_bc7_weights3[i] + 32) >> 6);
 	}
 
-	// Compute dots and thresholds
 	const int ar = highColor.m_c[0] - lowColor.m_c[0];
 	const int ag = highColor.m_c[1] - lowColor.m_c[1];
 	const int ab = highColor.m_c[2] - lowColor.m_c[2];
@@ -1481,126 +1731,143 @@ static uint64_t color_cell_compression_est_mode1(uint32_t num_pixels, const colo
 	for (uint32_t i = 0; i < N; i++)
 		dots[i] = weightedColors[i].m_c[0] * ar + weightedColors[i].m_c[1] * ag + weightedColors[i].m_c[2] * ab;
 
-	int thresh[8 - 1];
-	for (uint32_t i = 0; i < (N - 1); i++)
+	int thresh[7];
+	for (uint32_t i = 0; i < 7; i++)
 		thresh[i] = (dots[i] + dots[i + 1] + 1) >> 1;
 
+	int32_t palette0[8], palette1[8], palette2[8];
+	for (uint32_t i = 0; i < 8; i++)
+	{
+		if (perceptual)
+		{
+			const int32_t l = weightedColors[i].m_c[0] * 109 + weightedColors[i].m_c[1] * 366 + weightedColors[i].m_c[2] * 37;
+			palette0[i] = l;
+			palette1[i] = ((int32_t)weightedColors[i].m_c[0] << 9) - l;
+			palette2[i] = ((int32_t)weightedColors[i].m_c[2] << 9) - l;
+		}
+		else
+		{
+			palette0[i] = weightedColors[i].m_c[0];
+			palette1[i] = weightedColors[i].m_c[1];
+			palette2[i] = weightedColors[i].m_c[2];
+		}
+	}
+
+#if BC7ENC_AVX2
+	const __m256i vw0 = _mm256_set1_epi32((int)pweights[0]);
+	const __m256i vw1 = _mm256_set1_epi32((int)pweights[1]);
+	const __m256i vw2 = _mm256_set1_epi32((int)pweights[2]);
+	const __m256i var = _mm256_set1_epi32(ar);
+	const __m256i vag = _mm256_set1_epi32(ag);
+	const __m256i vab = _mm256_set1_epi32(ab);
+	const __m256i vp0 = _mm256_loadu_si256((const __m256i *)palette0);
+	const __m256i vp1 = _mm256_loadu_si256((const __m256i *)palette1);
+	const __m256i vp2 = _mm256_loadu_si256((const __m256i *)palette2);
+	__m256i total = _mm256_setzero_si256();
+
+	for (uint32_t chunk = 0; chunk < 2; chunk++)
+	{
+		const uint32_t base = chunk * 8;
+		const __m256i valid = make_avx2_mask8((pixel_mask >> base) & 0xFF);
+		const __m256i vr = _mm256_loadu_si256((const __m256i *)&pPlanes->m_r[base]);
+		const __m256i vg = _mm256_loadu_si256((const __m256i *)&pPlanes->m_g[base]);
+		const __m256i vb = _mm256_loadu_si256((const __m256i *)&pPlanes->m_b[base]);
+
+		const __m256i d = _mm256_add_epi32(_mm256_add_epi32(_mm256_mullo_epi32(vr, var), _mm256_mullo_epi32(vg, vag)), _mm256_mullo_epi32(vb, vab));
+		__m256i sel = _mm256_setzero_si256();
+		for (int t = 6; t >= 0; t--)
+			sel = _mm256_sub_epi32(sel, _mm256_cmpgt_epi32(d, _mm256_set1_epi32(thresh[t] - 1)));
+
+		__m256i e0 = _mm256_permutevar8x32_epi32(vp0, sel);
+		__m256i e1 = _mm256_permutevar8x32_epi32(vp1, sel);
+		__m256i e2 = _mm256_permutevar8x32_epi32(vp2, sel);
+		if (perceptual)
+		{
+			e0 = _mm256_srai_epi32(_mm256_sub_epi32(e0, _mm256_loadu_si256((const __m256i *)&pPlanes->m_l[base])), 8);
+			e1 = _mm256_srai_epi32(_mm256_sub_epi32(e1, _mm256_loadu_si256((const __m256i *)&pPlanes->m_cr[base])), 8);
+			e2 = _mm256_srai_epi32(_mm256_sub_epi32(e2, _mm256_loadu_si256((const __m256i *)&pPlanes->m_cb[base])), 8);
+		}
+		else
+		{
+			e0 = _mm256_sub_epi32(e0, vr);
+			e1 = _mm256_sub_epi32(e1, vg);
+			e2 = _mm256_sub_epi32(e2, vb);
+		}
+
+		__m256i err = _mm256_add_epi32(
+			_mm256_add_epi32(
+				_mm256_mullo_epi32(_mm256_mullo_epi32(e0, e0), vw0),
+				_mm256_mullo_epi32(_mm256_mullo_epi32(e1, e1), vw1)),
+			_mm256_mullo_epi32(_mm256_mullo_epi32(e2, e2), vw2));
+		total = _mm256_add_epi32(total, _mm256_and_si256(err, valid));
+	}
+
+	return horizontal_sum_u32(total);
+#else
 	uint64_t total_err = 0;
-	if (perceptual)
+	for (uint32_t i = 0; i < 16; i++)
 	{
-		// Transform block's interpolated colors to YCbCr
-		int l1[8], cr1[8], cb1[8];
-		for (int j = 0; j < 8; j++)
+		if ((pixel_mask & (1U << i)) == 0)
+			continue;
+
+		const int d = ar * pPlanes->m_r[i] + ag * pPlanes->m_g[i] + ab * pPlanes->m_b[i];
+		const uint32_t s = (uint32_t)(d >= thresh[0]) + (uint32_t)(d >= thresh[1]) + (uint32_t)(d >= thresh[2]) + (uint32_t)(d >= thresh[3]) + (uint32_t)(d >= thresh[4]) + (uint32_t)(d >= thresh[5]) + (uint32_t)(d >= thresh[6]);
+		int32_t e0, e1, e2;
+		if (perceptual)
 		{
-			const color_rgba *pE1 = &weightedColors[j];
-			l1[j] = pE1->m_c[0] * 109 + pE1->m_c[1] * 366 + pE1->m_c[2] * 37;
-			cr1[j] = ((int)pE1->m_c[0] << 9) - l1[j];
-			cb1[j] = ((int)pE1->m_c[2] << 9) - l1[j];
+			e0 = (palette0[s] - pPlanes->m_l[i]) >> 8;
+			e1 = (palette1[s] - pPlanes->m_cr[i]) >> 8;
+			e2 = (palette2[s] - pPlanes->m_cb[i]) >> 8;
 		}
-
-		for (uint32_t i = 0; i < num_pixels; i++)
+		else
 		{
-			const color_rgba *pC = &pPixels[i];
-
-			int d = ar * pC->m_c[0] + ag * pC->m_c[1] + ab * pC->m_c[2];
-
-			// Find approximate selector
-			uint32_t s = 0;
-			if (d >= thresh[6])
-				s = 7;
-			else if (d >= thresh[5])
-				s = 6;
-			else if (d >= thresh[4])
-				s = 5;
-			else if (d >= thresh[3])
-				s = 4;
-			else if (d >= thresh[2])
-				s = 3;
-			else if (d >= thresh[1])
-				s = 2;
-			else if (d >= thresh[0])
-				s = 1;
-
-			// Compute error
-			const int l2 = pC->m_c[0] * 109 + pC->m_c[1] * 366 + pC->m_c[2] * 37;
-			const int cr2 = ((int)pC->m_c[0] << 9) - l2;
-			const int cb2 = ((int)pC->m_c[2] << 9) - l2;
-
-			const int dl = (l1[s] - l2) >> 8;
-			const int dcr = (cr1[s] - cr2) >> 8;
-			const int dcb = (cb1[s] - cb2) >> 8;
-
-			int ie = (pweights[0] * dl * dl) + (pweights[1] * dcr * dcr) + (pweights[2] * dcb * dcb);
-
-			total_err += ie;
-			if (total_err > best_err_so_far)
-				break;
+			e0 = palette0[s] - pPlanes->m_r[i];
+			e1 = palette1[s] - pPlanes->m_g[i];
+			e2 = palette2[s] - pPlanes->m_b[i];
 		}
+		total_err += pweights[0] * (uint32_t)(e0 * e0) + pweights[1] * (uint32_t)(e1 * e1) + pweights[2] * (uint32_t)(e2 * e2);
 	}
-	else
-	{
-		for (uint32_t i = 0; i < num_pixels; i++)
-		{
-			const color_rgba *pC = &pPixels[i];
-
-			int d = ar * pC->m_c[0] + ag * pC->m_c[1] + ab * pC->m_c[2];
-
-			// Find approximate selector
-			uint32_t s = 0;
-			if (d >= thresh[6])
-				s = 7;
-			else if (d >= thresh[5])
-				s = 6;
-			else if (d >= thresh[4])
-				s = 5;
-			else if (d >= thresh[3])
-				s = 4;
-			else if (d >= thresh[2])
-				s = 3;
-			else if (d >= thresh[1])
-				s = 2;
-			else if (d >= thresh[0])
-				s = 1;
-
-			// Compute error
-			const color_rgba *pE1 = &weightedColors[s];
-
-			int dr = (int)pE1->m_c[0] - (int)pC->m_c[0];
-			int dg = (int)pE1->m_c[1] - (int)pC->m_c[1];
-			int db = (int)pE1->m_c[2] - (int)pC->m_c[2];
-
-			total_err += pweights[0] * (dr * dr) + pweights[1] * (dg * dg) + pweights[2] * (db * db);
-			if (total_err > best_err_so_far)
-				break;
-		}
-	}
-
 	return total_err;
+#endif
 }
 
-static uint64_t color_cell_compression_est_mode7(uint32_t num_pixels, const color_rgba * pPixels, bool perceptual, uint32_t pweights[4], uint64_t best_err_so_far)
+static uint64_t color_cell_compression_est_mode7(uint32_t num_pixels, const pixel_planes *pPlanes, uint16_t pixel_mask, bool perceptual, uint32_t pweights[4], uint64_t best_err_so_far)
 {
-	// Find RGB bounds as an approximation of the block's principle axis
+	(void)best_err_so_far;
+	(void)num_pixels;
+
+	// Find RGBA bounds as an approximation of the block's principle axis.
 	uint32_t lr = 255, lg = 255, lb = 255, la = 255;
 	uint32_t hr = 0, hg = 0, hb = 0, ha = 0;
-	for (uint32_t i = 0; i < num_pixels; i++)
+#if BC7ENC_AVX2
+	lr = reduce_masked_min_u32_256(pPlanes->m_r, pixel_mask);
+	lg = reduce_masked_min_u32_256(pPlanes->m_g, pixel_mask);
+	lb = reduce_masked_min_u32_256(pPlanes->m_b, pixel_mask);
+	la = reduce_masked_min_u32_256(pPlanes->m_a, pixel_mask);
+	hr = reduce_masked_max_u32_256(pPlanes->m_r, pixel_mask);
+	hg = reduce_masked_max_u32_256(pPlanes->m_g, pixel_mask);
+	hb = reduce_masked_max_u32_256(pPlanes->m_b, pixel_mask);
+	ha = reduce_masked_max_u32_256(pPlanes->m_a, pixel_mask);
+#else
+	for (uint32_t i = 0; i < 16; i++)
 	{
-		const color_rgba* pC = &pPixels[i];
-		if (pC->m_c[0] < lr) lr = pC->m_c[0];
-		if (pC->m_c[1] < lg) lg = pC->m_c[1];
-		if (pC->m_c[2] < lb) lb = pC->m_c[2];
-		if (pC->m_c[3] < la) la = pC->m_c[3];
-
-		if (pC->m_c[0] > hr) hr = pC->m_c[0];
-		if (pC->m_c[1] > hg) hg = pC->m_c[1];
-		if (pC->m_c[2] > hb) hb = pC->m_c[2];
-		if (pC->m_c[3] > ha) ha = pC->m_c[3];
+		if ((pixel_mask & (1U << i)) == 0)
+			continue;
+		lr = minimumu(lr, (uint32_t)pPlanes->m_r[i]);
+		lg = minimumu(lg, (uint32_t)pPlanes->m_g[i]);
+		lb = minimumu(lb, (uint32_t)pPlanes->m_b[i]);
+		la = minimumu(la, (uint32_t)pPlanes->m_a[i]);
+		hr = maximumu(hr, (uint32_t)pPlanes->m_r[i]);
+		hg = maximumu(hg, (uint32_t)pPlanes->m_g[i]);
+		hb = maximumu(hb, (uint32_t)pPlanes->m_b[i]);
+		ha = maximumu(ha, (uint32_t)pPlanes->m_a[i]);
 	}
+#endif
 
 	color_rgba lowColor; color_quad_u8_set(&lowColor, lr, lg, lb, la);
 	color_rgba highColor; color_quad_u8_set(&highColor, hr, hg, hb, ha);
 
-	// Place endpoints at bbox diagonals and compute interpolated colors 
+	// Place endpoints at bbox diagonals and compute interpolated colors.
 	const uint32_t N = 4;
 	color_rgba weightedColors[4];
 
@@ -1614,7 +1881,6 @@ static uint64_t color_cell_compression_est_mode7(uint32_t num_pixels, const colo
 		weightedColors[i].m_c[3] = (uint8_t)((lowColor.m_c[3] * (64 - g_bc7_weights2[i]) + highColor.m_c[3] * g_bc7_weights2[i] + 32) >> 6);
 	}
 
-	// Compute dots and thresholds
 	const int ar = highColor.m_c[0] - lowColor.m_c[0];
 	const int ag = highColor.m_c[1] - lowColor.m_c[1];
 	const int ab = highColor.m_c[2] - lowColor.m_c[2];
@@ -1624,88 +1890,115 @@ static uint64_t color_cell_compression_est_mode7(uint32_t num_pixels, const colo
 	for (uint32_t i = 0; i < N; i++)
 		dots[i] = weightedColors[i].m_c[0] * ar + weightedColors[i].m_c[1] * ag + weightedColors[i].m_c[2] * ab + weightedColors[i].m_c[3] * aa;
 
-	int thresh[4 - 1];
-	for (uint32_t i = 0; i < (N - 1); i++)
+	int thresh[3];
+	for (uint32_t i = 0; i < 3; i++)
 		thresh[i] = (dots[i] + dots[i + 1] + 1) >> 1;
 
+	int32_t palette0[4], palette1[4], palette2[4], palette3[4];
+	for (uint32_t i = 0; i < 4; i++)
+	{
+		if (perceptual)
+		{
+			const int32_t l = weightedColors[i].m_c[0] * 109 + weightedColors[i].m_c[1] * 366 + weightedColors[i].m_c[2] * 37;
+			palette0[i] = l;
+			palette1[i] = ((int32_t)weightedColors[i].m_c[0] << 9) - l;
+			palette2[i] = ((int32_t)weightedColors[i].m_c[2] << 9) - l;
+		}
+		else
+		{
+			palette0[i] = weightedColors[i].m_c[0];
+			palette1[i] = weightedColors[i].m_c[1];
+			palette2[i] = weightedColors[i].m_c[2];
+		}
+		palette3[i] = weightedColors[i].m_c[3];
+	}
+
+#if BC7ENC_AVX2
+	const __m256i vw0 = _mm256_set1_epi32((int)pweights[0]);
+	const __m256i vw1 = _mm256_set1_epi32((int)pweights[1]);
+	const __m256i vw2 = _mm256_set1_epi32((int)pweights[2]);
+	const __m256i vw3 = _mm256_set1_epi32((int)pweights[3]);
+	const __m256i var = _mm256_set1_epi32(ar);
+	const __m256i vag = _mm256_set1_epi32(ag);
+	const __m256i vab = _mm256_set1_epi32(ab);
+	const __m256i vaa = _mm256_set1_epi32(aa);
+	const __m256i vp0 = _mm256_setr_epi32(palette0[0], palette0[1], palette0[2], palette0[3], 0, 0, 0, 0);
+	const __m256i vp1 = _mm256_setr_epi32(palette1[0], palette1[1], palette1[2], palette1[3], 0, 0, 0, 0);
+	const __m256i vp2 = _mm256_setr_epi32(palette2[0], palette2[1], palette2[2], palette2[3], 0, 0, 0, 0);
+	const __m256i vp3 = _mm256_setr_epi32(palette3[0], palette3[1], palette3[2], palette3[3], 0, 0, 0, 0);
+	__m256i total = _mm256_setzero_si256();
+
+	for (uint32_t chunk = 0; chunk < 2; chunk++)
+	{
+		const uint32_t base = chunk * 8;
+		const __m256i valid = make_avx2_mask8((pixel_mask >> base) & 0xFF);
+		const __m256i vr = _mm256_loadu_si256((const __m256i *)&pPlanes->m_r[base]);
+		const __m256i vg = _mm256_loadu_si256((const __m256i *)&pPlanes->m_g[base]);
+		const __m256i vb = _mm256_loadu_si256((const __m256i *)&pPlanes->m_b[base]);
+		const __m256i va = _mm256_loadu_si256((const __m256i *)&pPlanes->m_a[base]);
+
+		const __m256i d = _mm256_add_epi32(
+			_mm256_add_epi32(_mm256_add_epi32(_mm256_mullo_epi32(vr, var), _mm256_mullo_epi32(vg, vag)), _mm256_mullo_epi32(vb, vab)),
+			_mm256_mullo_epi32(va, vaa));
+		__m256i sel = _mm256_setzero_si256();
+		for (int t = 2; t >= 0; t--)
+			sel = _mm256_sub_epi32(sel, _mm256_cmpgt_epi32(d, _mm256_set1_epi32(thresh[t] - 1)));
+
+		__m256i e0 = _mm256_permutevar8x32_epi32(vp0, sel);
+		__m256i e1 = _mm256_permutevar8x32_epi32(vp1, sel);
+		__m256i e2 = _mm256_permutevar8x32_epi32(vp2, sel);
+		if (perceptual)
+		{
+			e0 = _mm256_srai_epi32(_mm256_sub_epi32(e0, _mm256_loadu_si256((const __m256i *)&pPlanes->m_l[base])), 8);
+			e1 = _mm256_srai_epi32(_mm256_sub_epi32(e1, _mm256_loadu_si256((const __m256i *)&pPlanes->m_cr[base])), 8);
+			e2 = _mm256_srai_epi32(_mm256_sub_epi32(e2, _mm256_loadu_si256((const __m256i *)&pPlanes->m_cb[base])), 8);
+		}
+		else
+		{
+			e0 = _mm256_sub_epi32(e0, vr);
+			e1 = _mm256_sub_epi32(e1, vg);
+			e2 = _mm256_sub_epi32(e2, vb);
+		}
+
+		const __m256i ea = _mm256_sub_epi32(_mm256_permutevar8x32_epi32(vp3, sel), va);
+		__m256i err = _mm256_add_epi32(
+			_mm256_add_epi32(
+				_mm256_mullo_epi32(_mm256_mullo_epi32(e0, e0), vw0),
+				_mm256_mullo_epi32(_mm256_mullo_epi32(e1, e1), vw1)),
+			_mm256_add_epi32(
+				_mm256_mullo_epi32(_mm256_mullo_epi32(e2, e2), vw2),
+				_mm256_mullo_epi32(_mm256_mullo_epi32(ea, ea), vw3)));
+		total = _mm256_add_epi32(total, _mm256_and_si256(err, valid));
+	}
+
+	return horizontal_sum_u32(total);
+#else
 	uint64_t total_err = 0;
-	if (perceptual)
+	for (uint32_t i = 0; i < 16; i++)
 	{
-		// Transform block's interpolated colors to YCbCr
-		int l1[4], cr1[4], cb1[4];
-		for (int j = 0; j < 4; j++)
+		if ((pixel_mask & (1U << i)) == 0)
+			continue;
+
+		const int d = ar * pPlanes->m_r[i] + ag * pPlanes->m_g[i] + ab * pPlanes->m_b[i] + aa * pPlanes->m_a[i];
+		const uint32_t s = (uint32_t)(d >= thresh[0]) + (uint32_t)(d >= thresh[1]) + (uint32_t)(d >= thresh[2]);
+		int32_t e0, e1, e2;
+		if (perceptual)
 		{
-			const color_rgba* pE1 = &weightedColors[j];
-			l1[j] = pE1->m_c[0] * 109 + pE1->m_c[1] * 366 + pE1->m_c[2] * 37;
-			cr1[j] = ((int)pE1->m_c[0] << 9) - l1[j];
-			cb1[j] = ((int)pE1->m_c[2] << 9) - l1[j];
+			e0 = (palette0[s] - pPlanes->m_l[i]) >> 8;
+			e1 = (palette1[s] - pPlanes->m_cr[i]) >> 8;
+			e2 = (palette2[s] - pPlanes->m_cb[i]) >> 8;
 		}
-
-		for (uint32_t i = 0; i < num_pixels; i++)
+		else
 		{
-			const color_rgba* pC = &pPixels[i];
-
-			int d = ar * pC->m_c[0] + ag * pC->m_c[1] + ab * pC->m_c[2] + aa * pC->m_c[3];
-
-			// Find approximate selector
-			uint32_t s = 0;
-			if (d >= thresh[2])
-				s = 3;
-			else if (d >= thresh[1])
-				s = 2;
-			else if (d >= thresh[0])
-				s = 1;
-
-			// Compute error
-			const int l2 = pC->m_c[0] * 109 + pC->m_c[1] * 366 + pC->m_c[2] * 37;
-			const int cr2 = ((int)pC->m_c[0] << 9) - l2;
-			const int cb2 = ((int)pC->m_c[2] << 9) - l2;
-
-			const int dl = (l1[s] - l2) >> 8;
-			const int dcr = (cr1[s] - cr2) >> 8;
-			const int dcb = (cb1[s] - cb2) >> 8;
-
-			const int dca = (int)pC->m_c[3] - (int)weightedColors[s].m_c[3];
-
-			int ie = (pweights[0] * dl * dl) + (pweights[1] * dcr * dcr) + (pweights[2] * dcb * dcb) + (pweights[3] * dca * dca);
-
-			total_err += ie;
-			if (total_err > best_err_so_far)
-				break;
+			e0 = palette0[s] - pPlanes->m_r[i];
+			e1 = palette1[s] - pPlanes->m_g[i];
+			e2 = palette2[s] - pPlanes->m_b[i];
 		}
+		const int32_t ea = palette3[s] - pPlanes->m_a[i];
+		total_err += pweights[0] * (uint32_t)(e0 * e0) + pweights[1] * (uint32_t)(e1 * e1) + pweights[2] * (uint32_t)(e2 * e2) + pweights[3] * (uint32_t)(ea * ea);
 	}
-	else
-	{
-		for (uint32_t i = 0; i < num_pixels; i++)
-		{
-			const color_rgba* pC = &pPixels[i];
-
-			int d = ar * pC->m_c[0] + ag * pC->m_c[1] + ab * pC->m_c[2] + aa * pC->m_c[3];
-
-			// Find approximate selector
-			uint32_t s = 0;
-			if (d >= thresh[2])
-				s = 3;
-			else if (d >= thresh[1])
-				s = 2;
-			else if (d >= thresh[0])
-				s = 1;
-
-			// Compute error
-			const color_rgba* pE1 = &weightedColors[s];
-
-			int dr = (int)pE1->m_c[0] - (int)pC->m_c[0];
-			int dg = (int)pE1->m_c[1] - (int)pC->m_c[1];
-			int db = (int)pE1->m_c[2] - (int)pC->m_c[2];
-			int da = (int)pE1->m_c[3] - (int)pC->m_c[3];
-
-			total_err += pweights[0] * (dr * dr) + pweights[1] * (dg * dg) + pweights[2] * (db * db) + pweights[3] * (da * da);
-			if (total_err > best_err_so_far)
-				break;
-		}
-	}
-
 	return total_err;
+#endif
 }
 
 // This table contains bitmasks indicating which "key" partitions must be best ranked before this partition is worth evaluating.
@@ -1751,8 +2044,9 @@ static const uint32_t g_partition_predictors[35] =
 };
 
 // Estimate the partition used by modes 1/7. This scans through each partition and computes an approximate error for each.
-static uint32_t estimate_partition(const color_rgba *pPixels, const bc7enc_compress_block_params *pComp_params, uint32_t pweights[4], uint32_t mode)
+static uint32_t estimate_partition(const color_rgba *pPixels, const pixel_planes *pPlanes, const bc7enc_compress_block_params *pComp_params, uint32_t pweights[4], uint32_t mode)
 {
+	(void)pPixels;
 	const uint32_t total_partitions = minimumu(pComp_params->m_max_partitions, BC7ENC_MAX_PARTITIONS);
 	if (total_partitions <= 1)
 		return 0;
@@ -1798,20 +2092,15 @@ static uint32_t estimate_partition(const color_rgba *pPixels, const bc7enc_compr
 			}
 		}
 
-		const uint8_t *pPartition = &g_bc7_partition2[partition * 16];
-
-		color_rgba subset_colors[2][16];
-		uint32_t subset_total_colors[2] = { 0, 0 };
-		for (uint32_t index = 0; index < 16; index++)
-			subset_colors[pPartition[index]][subset_total_colors[pPartition[index]]++] = pPixels[index];
-						
 		uint64_t total_subset_err = 0;
 		for (uint32_t subset = 0; (subset < 2) && (total_subset_err < best_err); subset++)
 		{
+			const uint16_t pixel_mask = g_bc7_partition2_pixelmask[partition][subset];
+			const uint32_t subset_pixels = g_bc7_partition2_subset_size[partition][subset];
 			if (mode == 7)
-				total_subset_err += color_cell_compression_est_mode7(subset_total_colors[subset], &subset_colors[subset][0], pComp_params->m_perceptual, pweights, best_err);
+				total_subset_err += color_cell_compression_est_mode7(subset_pixels, pPlanes, pixel_mask, pComp_params->m_perceptual, pweights, best_err);
 			else
-				total_subset_err += color_cell_compression_est_mode1(subset_total_colors[subset], &subset_colors[subset][0], pComp_params->m_perceptual, pweights, best_err);
+				total_subset_err += color_cell_compression_est_mode1(subset_pixels, pPlanes, pixel_mask, pComp_params->m_perceptual, pweights, best_err);
 		}
 
 		if (partition < 16)
@@ -2136,7 +2425,7 @@ static void handle_alpha_block_mode5(const color_rgba* pPixels, const bc7enc_com
 	}
 }
 
-static void handle_alpha_block(void *pBlock, const color_rgba *pPixels, const bc7enc_compress_block_params *pComp_params, color_cell_compressor_params *pParams)
+static void handle_alpha_block(void *pBlock, const color_rgba *pPixels, const pixel_planes *pPlanes, const bc7enc_compress_block_params *pComp_params, color_cell_compressor_params *pParams)
 {
 	assert((pComp_params->m_mode_mask & (1 << 6)) || (pComp_params->m_mode_mask & (1 << 5)) || (pComp_params->m_mode_mask & (1 << 7)));
 
@@ -2192,7 +2481,7 @@ static void handle_alpha_block(void *pBlock, const color_rgba *pPixels, const bc
 
 	if ((best_err > 0) && (pComp_params->m_mode_mask & (1 << 7)))
 	{
-		const uint32_t trial_partition = estimate_partition(pPixels, pComp_params, pParams->m_weights, 7);
+		const uint32_t trial_partition = estimate_partition(pPixels, pPlanes, pComp_params, pParams->m_weights, 7);
 
 		pParams->m_pSelector_weights = g_bc7_weights2;
 		pParams->m_pSelector_weightsx = (const vec4F*)g_bc7_weights2x;
@@ -2290,7 +2579,7 @@ static void handle_alpha_block(void *pBlock, const color_rgba *pPixels, const bc
 	}
 }
 
-static void handle_opaque_block(void *pBlock, const color_rgba *pPixels, const bc7enc_compress_block_params *pComp_params, color_cell_compressor_params *pParams)
+static void handle_opaque_block(void *pBlock, const color_rgba *pPixels, const pixel_planes *pPlanes, const bc7enc_compress_block_params *pComp_params, color_cell_compressor_params *pParams)
 {
 	assert((pComp_params->m_mode_mask & (1 << 6)) || (pComp_params->m_mode_mask & (1 << 1)));
 
@@ -2335,7 +2624,7 @@ static void handle_opaque_block(void *pBlock, const color_rgba *pPixels, const b
 	// Mode 1
 	if ((best_err > 0) && (pComp_params->m_max_partitions > 0) && (pComp_params->m_mode_mask & (1 << 1)))
 	{
-		const uint32_t trial_partition = estimate_partition(pPixels, pComp_params, pParams->m_weights, 1);
+		const uint32_t trial_partition = estimate_partition(pPixels, pPlanes, pComp_params, pParams->m_weights, 1);
 		
 		pParams->m_pSelector_weights = g_bc7_weights3;
 		pParams->m_pSelector_weightsx = (const vec4F *)g_bc7_weights3x;
@@ -2418,10 +2707,14 @@ bool bc7enc_compress_block(void *pBlock, const void *pPixelsRGBA, const bc7enc_c
 	}
 	else
 		memcpy(params.m_weights, pComp_params->m_weights, sizeof(params.m_weights));
+
+	pixel_planes block_planes;
+	compute_pixel_planes(pPixels, 16, &block_planes);
+	params.m_pPlanes = &block_planes;
 	
 	if (pComp_params->m_force_alpha)
 	{
-		handle_alpha_block(pBlock, pPixels, pComp_params, &params);
+		handle_alpha_block(pBlock, pPixels, &block_planes, pComp_params, &params);
 		return true;
 	}
 
@@ -2429,11 +2722,11 @@ bool bc7enc_compress_block(void *pBlock, const void *pPixelsRGBA, const bc7enc_c
 	{
 		if (pPixels[i].m_c[3] < 255)
 		{
-			handle_alpha_block(pBlock, pPixels, pComp_params, &params);
+			handle_alpha_block(pBlock, pPixels, &block_planes, pComp_params, &params);
 			return true;
 		}
 	}
-	handle_opaque_block(pBlock, pPixels, pComp_params, &params);
+	handle_opaque_block(pBlock, pPixels, &block_planes, pComp_params, &params);
 	return false;
 }
 
