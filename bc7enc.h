@@ -44,6 +44,7 @@ struct bc7enc_compress_block_params
 
 	float m_pbit1_weight;
 
+	float m_mode0_error_weight;
 	float m_mode1_error_weight;
 	float m_mode5_error_weight;
 	float m_mode6_error_weight;
@@ -69,6 +70,7 @@ struct bc7enc_compress_block_params
 		printf("Quant mode 6 endpoints: %u\n", m_quant_mode6_endpoints);
 		printf("Bias mode 1 p-bits: %u\n", m_bias_mode1_pbits);
 		printf("p-bit 1 weight: %f\n", m_pbit1_weight);
+		printf("Mode 0 error weight: %f\n", m_mode0_error_weight);
 		printf("Mode error weights: %f %f %f %f\n", m_mode1_error_weight, m_mode5_error_weight, m_mode6_error_weight, m_mode7_error_weight);
 		printf("Low frequency partition weight: %f\n", m_low_frequency_partition_weight);
 	}
@@ -104,6 +106,7 @@ inline void bc7enc_compress_block_params_init(bc7enc_compress_block_params *p)
 	p->m_quant_mode6_endpoints = false;
 	p->m_bias_mode1_pbits = false;
 	p->m_pbit1_weight = 1.0f;
+	p->m_mode0_error_weight = 1.0f;
 	p->m_mode1_error_weight = 1.0f;
 	p->m_mode5_error_weight = 1.0f;
 	p->m_mode6_error_weight = 1.0f;
@@ -119,5 +122,4 @@ void bc7enc_compress_block_init();
 // Alpha blocks will always use mode 6, and by default opaque blocks will use either modes 1 or 6.
 // Returns true if the block had any pixels with alpha < 255, otherwise it return false. (This is not an error code - a block is always encoded.)
 bool bc7enc_compress_block(void *pBlock, const void *pPixelsRGBA, const bc7enc_compress_block_params *pComp_params);
-
 

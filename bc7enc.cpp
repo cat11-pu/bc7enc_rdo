@@ -1837,6 +1837,65 @@ static uint32_t estimate_partition(const color_rgba *pPixels, const bc7enc_compr
 	return best_partition;
 }
 
+// Estimate the best 3-subset partition for mode 0. Mode 0 only has 4-bit endpoints,
+// so each subset's error is dominated by the spread of the colors assigned to it.
+// The estimator measures within-subset variance against the subset mean, which is
+// cheap and directly predicts how well a single interpolated line can fit the subset.
+static uint32_t estimate_partition3(const color_rgba *pPixels, const bc7enc_compress_block_params *pComp_params, uint32_t pweights[4])
+{
+	// Mode 0 only has 4 partition bits, so the first 16 entries of the 3-subset table are valid.
+	// The low-frequency 3-subset patterns are ordered first in the spec table; evaluating the first
+	// 8 captures essentially all useful hard-edge partitions at roughly half the estimator cost.
+	const uint32_t total_partitions = minimumu(minimumu(pComp_params->m_max_partitions, BC7ENC_MAX_PARTITIONS), 8u);
+
+	uint64_t best_err = UINT64_MAX;
+	uint32_t best_partition = 0;
+
+	for (uint32_t partition = 0; partition < total_partitions; partition++)
+	{
+		const uint8_t *pPartition = &g_bc7_partition3[partition * 16];
+
+		uint32_t sums[3][3] = { 0 };
+		uint64_t sumsq[3][3] = { 0 };
+		uint32_t counts[3] = { 0, 0, 0 };
+		for (uint32_t index = 0; index < 16; index++)
+		{
+			const uint32_t subset = pPartition[index];
+			counts[subset]++;
+			for (uint32_t c = 0; c < 3; c++)
+			{
+				sums[subset][c] += pPixels[index].m_c[c];
+				sumsq[subset][c] += (uint64_t)pPixels[index].m_c[c] * pPixels[index].m_c[c];
+			}
+		}
+
+		// Within-subset sum of squared deviations from the mean, computed without per-pixel
+		// division: sum (x - mean)^2 = sum x^2 - (sum x)^2 / n. The integer division by n is
+		// evaluated once per subset/channel, and the constant block total is dropped.
+		uint64_t total_subset_err = 0;
+		for (uint32_t subset = 0; subset < 3; subset++)
+		{
+			const uint32_t n = counts[subset];
+			for (uint32_t c = 0; c < 3; c++)
+			{
+				uint64_t sq = sumsq[subset][c];
+				uint64_t s = sums[subset][c];
+				total_subset_err += (uint64_t)pweights[c] * (sq >= (s * s) / n ? sq - (s * s) / n : 0);
+			}
+			if (total_subset_err >= best_err)
+				break;
+		}
+
+		if (total_subset_err < best_err)
+		{
+			best_err = total_subset_err;
+			best_partition = partition;
+		}
+	}
+
+	return best_partition;
+}
+
 static void set_block_bits(uint8_t *pBytes, uint32_t val, uint32_t num_bits, uint32_t *pCur_ofs)
 {
 	assert((num_bits <= 32) && (val < (1ULL << num_bits)));
@@ -2292,7 +2351,7 @@ static void handle_alpha_block(void *pBlock, const color_rgba *pPixels, const bc
 
 static void handle_opaque_block(void *pBlock, const color_rgba *pPixels, const bc7enc_compress_block_params *pComp_params, color_cell_compressor_params *pParams)
 {
-	assert((pComp_params->m_mode_mask & (1 << 6)) || (pComp_params->m_mode_mask & (1 << 1)));
+	assert((pComp_params->m_mode_mask & (1 << 6)) || (pComp_params->m_mode_mask & (1 << 1)) || (pComp_params->m_mode_mask & (1 << 0)));
 
 	uint8_t selectors_temp[16];
 		
@@ -2392,6 +2451,111 @@ static void handle_opaque_block(void *pBlock, const color_rgba *pPixels, const b
 				opt_results.m_low[subset] = subset_results1[subset].m_low_endpoint;
 				opt_results.m_high[subset] = subset_results1[subset].m_high_endpoint;
 				opt_results.m_pbits[subset][0] = subset_results1[subset].m_pbits[0];
+			}
+		}
+	}
+
+	// Mode 0: 3 subsets, 4-bit endpoints with separate p-bits, 8 selectors.
+	// This is the only scalar-encoder mode that can separate 3+ distinct color regions in a block,
+	// which is what hard-edge blocks with several flat colors need. It is evaluated last because its
+	// coarse 4-bit endpoints make it a poor choice for smooth gradients, where mode 6 dominates.
+	//
+	// Gate on the block's color distribution: mode 0 only pays off when a block contains several
+	// well separated color clusters (hard edges). For smooth/gradient blocks the existing modes win,
+	// so we skip mode 0 entirely to protect encoding speed.
+	bool try_mode0 = false;
+	if ((best_err > 0) && (pComp_params->m_max_partitions > 0) && (pComp_params->m_mode_mask & (1 << 0)))
+	{
+		// Distinguish a hard-edge block (a few spatially coherent, strongly separated color regions)
+		// from a gradient block (a smooth continuum). Coarse RGB bins alone cannot tell them apart
+		// because a 0..255 ramp also visits many bins. Instead we measure, at 4x4 block scale, the
+		// fraction of 4-connected neighbor pairs whose color jump is large: hard edges produce a small
+		// set of large jumps against a zero-jump background, while gradients produce only small steps.
+		uint32_t strong_edges = 0;
+		for (uint32_t y = 0; y < 4; y++)
+		{
+			for (uint32_t x = 0; x < 4; x++)
+			{
+				const color_rgba *a = &pPixels[y * 4 + x];
+				if (x + 1 < 4)
+				{
+					const color_rgba *b = &pPixels[y * 4 + (x + 1)];
+					uint32_t d = (uint32_t)(squarei((int)a->m_c[0] - b->m_c[0]) + squarei((int)a->m_c[1] - b->m_c[1]) + squarei((int)a->m_c[2] - b->m_c[2]));
+					if (d >= 64 * 64) strong_edges++;
+				}
+				if (y + 1 < 4)
+				{
+					const color_rgba *b = &pPixels[(y + 1) * 4 + x];
+					uint32_t d = (uint32_t)(squarei((int)a->m_c[0] - b->m_c[0]) + squarei((int)a->m_c[1] - b->m_c[1]) + squarei((int)a->m_c[2] - b->m_c[2]));
+					if (d >= 64 * 64) strong_edges++;
+				}
+			}
+		}
+
+		// Measured across hard-edge vs. gradient content, a coherent hard edge produces a tight band
+		// of strong neighbor jumps (around a third of the 24 pairs) while smooth gradients produce
+		// none. Require several strong jumps so isolated outliers do not trigger mode 0.
+		try_mode0 = strong_edges >= 4;
+	}
+
+	if (try_mode0)
+	{
+		const uint32_t trial_partition = estimate_partition3(pPixels, pComp_params, pParams->m_weights);
+
+		pParams->m_pSelector_weights = g_bc7_weights3;
+		pParams->m_pSelector_weightsx = (const vec4F *)g_bc7_weights3x;
+		pParams->m_num_selector_weights = 8;
+		pParams->m_comp_bits = 4;
+		pParams->m_has_pbits = true;
+		pParams->m_endpoints_share_pbit = false;
+
+		const uint8_t *pPartition = &g_bc7_partition3[trial_partition * 16];
+
+		color_rgba subset_colors[3][16];
+		uint32_t subset_total_colors0[3] = { 0, 0, 0 };
+		uint8_t subset_pixel_index0[3][16];
+		uint8_t subset_selectors0[3][16];
+		color_cell_compressor_results subset_results0[3];
+
+		for (uint32_t idx = 0; idx < 16; idx++)
+		{
+			const uint32_t p = pPartition[idx];
+			subset_colors[p][subset_total_colors0[p]] = pPixels[idx];
+			subset_pixel_index0[p][subset_total_colors0[p]] = (uint8_t)idx;
+			subset_total_colors0[p]++;
+		}
+
+		uint64_t trial_err = 0;
+		for (uint32_t subset = 0; subset < 3; subset++)
+		{
+			pParams->m_num_pixels = subset_total_colors0[subset];
+			pParams->m_pPixels = &subset_colors[subset][0];
+
+			color_cell_compressor_results *pResults = &subset_results0[subset];
+			pResults->m_pSelectors = &subset_selectors0[subset][0];
+			pResults->m_pSelectors_temp = selectors_temp;
+
+			trial_err += color_cell_compression(0, pParams, pResults, pComp_params);
+			if ((uint64_t)(trial_err * pComp_params->m_mode0_error_weight + .5f) > best_err)
+				break;
+		}
+
+		const uint64_t mode0_trial_err = (uint64_t)(trial_err * pComp_params->m_mode0_error_weight + .5f);
+		if (mode0_trial_err < best_err)
+		{
+			best_err = mode0_trial_err;
+			opt_results.m_mode = 0;
+			opt_results.m_partition = trial_partition;
+			opt_results.m_index_selector = 0;
+			opt_results.m_rotation = 0;
+			for (uint32_t subset = 0; subset < 3; subset++)
+			{
+				for (uint32_t i = 0; i < subset_total_colors0[subset]; i++)
+					opt_results.m_selectors[subset_pixel_index0[subset][i]] = subset_selectors0[subset][i];
+				opt_results.m_low[subset] = subset_results0[subset].m_low_endpoint;
+				opt_results.m_high[subset] = subset_results0[subset].m_high_endpoint;
+				opt_results.m_pbits[subset][0] = subset_results0[subset].m_pbits[0];
+				opt_results.m_pbits[subset][1] = subset_results0[subset].m_pbits[1];
 			}
 		}
 	}
